@@ -15,11 +15,20 @@ type staged struct {
 	InsertOnly bool
 }
 type Transaction struct {
-	ID       string `json:"id"`
-	Snapshot uint64 `json:"snapshot"`
-	ReadOnly bool   `json:"read_only"`
-	Started  string `json:"started"`
-	writes   map[string]map[string]staged
+	ID          string          `json:"id"`
+	Snapshot    uint64          `json:"snapshot"`
+	ReadOnly    bool            `json:"read_only"`
+	Started     string          `json:"started"`
+	StagedKeys  int             `json:"staged_keys"`
+	Savepoints  []SavepointInfo `json:"savepoints"`
+	Memory      MemoryUsage     `json:"memory"`
+	writes      map[string]map[string]staged
+	savepoints  []*savepointMarker
+	undo        []undoEntry
+	undoDepth   map[string]int
+	nextDepth   int
+	stagedBytes int
+	undoBytes   int
 }
 type Commit struct {
 	Sequence uint64 `json:"sequence"`
@@ -39,11 +48,9 @@ func (d *DB) Begin(readOnly bool) (Transaction, error) {
 	if _, err := rand.Read(id[:]); err != nil {
 		return Transaction{}, err
 	}
-	tx := &Transaction{ID: hex.EncodeToString(id[:]), Snapshot: d.sequence, ReadOnly: readOnly, Started: time.Now().UTC().Format(time.RFC3339Nano), writes: map[string]map[string]staged{}}
+	tx := &Transaction{ID: hex.EncodeToString(id[:]), Snapshot: d.sequence, ReadOnly: readOnly, Started: time.Now().UTC().Format(time.RFC3339Nano), writes: map[string]map[string]staged{}, undoDepth: map[string]int{}}
 	d.transactions[tx.ID] = tx
-	out := *tx
-	out.writes = nil
-	return out, nil
+	return tx.view(), nil
 }
 func (d *DB) tx(id string) (*Transaction, error) {
 	tx, ok := d.transactions[id]
@@ -84,14 +91,7 @@ func (d *DB) Put(id, table string, row datum.Row, insertOnly bool) error {
 			return fault("conflict", "primary already exists")
 		}
 	}
-	if tx.writes[table] == nil {
-		tx.writes[table] = map[string]staged{}
-	}
-	if err = tx.reserve(table, key); err != nil {
-		return err
-	}
-	tx.writes[table][key] = staged{Mutation: versions.Mutation{Relation: table, Key: key, Row: normalized}, InsertOnly: insertOnly}
-	return nil
+	return tx.stage(table, key, staged{Mutation: versions.Mutation{Relation: table, Key: key, Row: normalized}, InsertOnly: insertOnly})
 }
 func (tx *Transaction) reserve(table, key string) error {
 	if _, exists := tx.writes[table][key]; exists {
@@ -131,14 +131,7 @@ func (d *DB) Delete(id, table string, value datum.Value) error {
 		return fault("invalid", "invalid primary value")
 	}
 	key := value.Key()
-	if tx.writes[table] == nil {
-		tx.writes[table] = map[string]staged{}
-	}
-	if err = tx.reserve(table, key); err != nil {
-		return err
-	}
-	tx.writes[table][key] = staged{Mutation: versions.Mutation{Relation: table, Key: key, Deleted: true}}
-	return nil
+	return tx.stage(table, key, staged{Mutation: versions.Mutation{Relation: table, Key: key, Deleted: true}})
 }
 func (d *DB) Rollback(id string) error {
 	d.mu.Lock()

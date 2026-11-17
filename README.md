@@ -19,7 +19,7 @@ go build -o bin/laminad ./cmd/laminad
 python3 examples/walkthrough.py --workflow all
 ```
 
-该命令启动临时实例，执行 14 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。
+该命令启动临时实例，执行 15 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。
 
 ## 一个事务
 
@@ -39,6 +39,23 @@ curl -s http://127.0.0.1:7386/v1/lamina/sql -H 'Content-Type: application/json' 
 ```
 
 `put` 是完整行替换；缺失的可空列补为 null，缺失的非空列拒绝。主键从新行中取得，不提供原主键重命名操作。删除接口为事务 URL 下的 `delete`，正文为 `{"relation":"spectra","key":1}`；不存在的键也可以形成墓碑。DDL 自身是单个耐久操作，不在用户事务中暂存。
+
+## 保存点与局部回撤
+
+保存点是写事务私有的命名回撤标记，仅驻留内存：不写日志、不进检查点或备份，事务提交、回滚或进程关闭后即消失，重启后不存在悬挂状态。名称与关系名同规则（`^[a-z][a-z0-9_]{0,62}$`），同一事务内名称唯一，重复创建返回 409；释放后名称可复用，但保存点深度单调递增、不复用。
+
+```sh
+curl -s -X POST http://127.0.0.1:7386/v1/lamina/transactions/<id>/savepoints -H 'Content-Type: application/json' -d '{"name":"before_fix"}'
+curl -s -X POST http://127.0.0.1:7386/v1/lamina/transactions/<id>/savepoints/rollback -H 'Content-Type: application/json' -d '{"name":"before_fix"}'
+curl -s -X POST http://127.0.0.1:7386/v1/lamina/transactions/<id>/savepoints/release -H 'Content-Type: application/json' -d '{"name":"before_fix"}'
+curl -s http://127.0.0.1:7386/v1/lamina/transactions/<id>/savepoints
+```
+
+保存点采用扁平 undo 日志而非整份写集快照：只有某个键在当前保存点区间内首次被改动时，才记录该键当时的暂存值（或“原本未暂存”的空影子），反复保存大行不会复制整份历史写集。回退按时间顺序应用目标深度及更深的 undo 记录，每个键只取最早一条，因此删除后重新写入、同键多次覆盖、嵌套保存点、释放后复用同名都恢复到保存点创建时刻的一致状态。回退保留目标保存点本身，并丢弃其内部更深的保存点；释放只移除标记，旧 undo 影子仍按深度参与更早保存点的回退。
+
+回退后的幸存写集是下一次读取和提交的唯一事实：事务内查询通过同一套私有 overlay 立即看到回撤结果，提交时唯一索引和 first-committer-wins 校验面向幸存写集与已提交状态合并后的最终状态，失败提交仍整体关闭、不发布任何私有行。
+
+每个事务最多 64 个活跃保存点深度；暂存行与 undo 影子合计预算 16MiB，超限返回 429 且**先校验后改动**，错误信息带暂存/undo 已用字节与上限，已保留的写集和保存点不受影响；回退会释放对应暂存字节。保存点接口返回 `depth`、`staged_keys`、`active_savepoints` 及分项内存账，`GET /stats` 的活跃事务也带保存点清单与预算事实。只读事务不能创建保存点（409），已关闭事务的保存点路由返回 404。
 
 ## 查询与隔离
 
@@ -89,7 +106,7 @@ curl -s http://127.0.0.1:7386/v1/lamina/backup -o /tmp/lamina-backup.lmi
 
 ## 资源与错误
 
-请求体上限 1MiB，列数 64，文本值 64KiB，活动事务 128，每事务最终写集 1000 个键，单日志帧 16MiB，镜像 128MiB。查询最多 32 个 AND 谓词、8 个排序项，默认输出 1000 行，可显式设到 10000；截断时 `truncated=true`。查询执行仍可能物化全部匹配行，事务没有自动过期，排序和备份没有外溢机制，应显式关闭不用的会话并为演练设置合理数据规模。
+请求体上限 1MiB，列数 64，文本值 64KiB，活动事务 128，每事务最终写集 1000 个键、活跃保存点 64 个、暂存写集与保存点 undo 影子合计 16MiB，单日志帧 16MiB，镜像 128MiB。查询最多 32 个 AND 谓词、8 个排序项，默认输出 1000 行，可显式设到 10000；截断时 `truncated=true`。查询执行仍可能物化全部匹配行，事务没有自动过期，排序和备份没有外溢机制，应显式关闭不用的会话并为演练设置合理数据规模。
 
 错误 JSON 为 `{"error":{"code":"...","message":"..."}}`。无效输入 400，已关闭或未知事务及缺失行 404，写冲突或唯一冲突 409，快照和变更历史不可用 410，容量拒绝 429，存储不确定或已关闭 503。`GET /stats` 返回会话、版本、候选索引大小、恢复尾字节等领域事实，进程计数在重启后归零。
 

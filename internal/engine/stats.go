@@ -26,9 +26,7 @@ func (d *DB) Stats() (Stats, error) {
 	keys, versions := d.store.Count()
 	s := Stats{Sequence: d.sequence, Horizon: d.horizon, Keys: keys, Versions: versions, Active: []Transaction{}, IndexEntries: map[string]int{}, JournalRecords: len(d.wal.Records), HistoryBase: d.wal.Base, RecoveredTail: d.wal.RecoveredTail, Commits: d.commits, Conflicts: d.conflicts, Queries: d.queries}
 	for _, tx := range d.transactions {
-		copy := *tx
-		copy.writes = nil
-		s.Active = append(s.Active, copy)
+		s.Active = append(s.Active, tx.view())
 	}
 	sort.Slice(s.Active, func(i, j int) bool { return s.Active[i].ID < s.Active[j].ID })
 	for name, t := range d.indexes.Trees {

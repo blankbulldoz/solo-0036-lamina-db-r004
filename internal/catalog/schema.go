@@ -10,6 +10,8 @@ var identifier = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
 
 func ValidName(s string) bool { return identifier.MatchString(s) }
 
+func NamePattern() string { return "^[a-z][a-z0-9_]{0,62}$" }
+
 type Column struct {
 	Name     string `json:"name"`
 	Type     string `json:"type"`
